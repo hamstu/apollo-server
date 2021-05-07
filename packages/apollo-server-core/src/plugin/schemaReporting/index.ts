@@ -7,6 +7,7 @@ import { SchemaReporter } from './schemaReporter';
 import createSHA from '../../utils/createSHA';
 import { schemaIsFederated } from '../schemaIsFederated';
 import { SchemaReport } from './operations';
+import { GraphQLService, Unsubscriber } from '../../types';
 
 export interface ApolloServerPluginSchemaReportingOptions {
   /**
@@ -54,6 +55,14 @@ export interface ApolloServerPluginSchemaReportingOptions {
    * Specifies which Fetch API implementation to use when reporting schemas.
    */
   fetcher?: typeof fetch;
+  /**
+   * To enable schema reporting for federated graphs, you must pass in your
+   * gateway instance. Note that overrideReportedSchema is incompatible with
+   * this option, as the schema SDL is given directly by gateway. If you would
+   * like to customize the schema SDL reported, please instead set the option
+   * experimental_updateSupergraphSdl in your gateway configuration.
+   */
+  gateway?: GraphQLService;
 }
 
 export function ApolloServerPluginSchemaReporting(
@@ -62,9 +71,33 @@ export function ApolloServerPluginSchemaReporting(
     overrideReportedSchema,
     endpointUrl,
     fetcher,
+    gateway,
   }: ApolloServerPluginSchemaReportingOptions = Object.create(null),
 ): InternalApolloServerPlugin {
   const bootId = uuidv4();
+
+  let currentCoreSchema: string | undefined;
+  let currentSchemaReporter: SchemaReporter | undefined;
+  let gatewaySchemaChangeUnsubscriber: Unsubscriber | undefined;
+  if (gateway) {
+    gatewaySchemaChangeUnsubscriber = gateway.onSchemaChange((_, coreSchema) => {
+      currentCoreSchema = coreSchema;
+      if (currentSchemaReporter) {
+        const options = currentSchemaReporter.toOptions();
+        currentSchemaReporter.stop();
+        const coreSchemaHash = computeCoreSchemaHash(coreSchema);
+        currentSchemaReporter = new SchemaReporter({
+          ...options,
+          coreSchema,
+          schemaReport: {
+            ...options.schemaReport,
+            coreSchemaHash,
+          },
+        });
+        currentSchemaReporter.start();
+      }
+    });
+  }
 
   return {
     __internal_plugin_id__() {
@@ -108,19 +141,51 @@ export function ApolloServerPluginSchemaReporting(
       }
 
       if (schemaIsFederated(schema)) {
-        throw Error(
-          [
-            'Schema reporting is not yet compatible with federated services.',
-            "If you're interested in using schema reporting with federated",
-            'services, please contact Apollo support. To set up managed federation, see',
-            'https://go.apollo.dev/s/managed-federation',
-          ].join(' '),
-        );
+        if (!gateway) {
+          throw new Error(
+            [
+              `To use schema reporting with gateways, you must provide the`,
+              `gateway instance in the plugin options.`,
+            ].join(' '),
+          );
+        }
       }
 
-      // Note that this is not actually the core schema for supergraphs yet, but
-      // this will be fixed by #5187.
-      const coreSchema = overrideReportedSchema ?? printSchema(schema);
+      let coreSchema: string =
+        overrideReportedSchema ?? printSchema(schema);
+      if (gateway) {
+        if (overrideReportedSchema) {
+          throw new Error(
+            [
+              `The overrideReportedSchema option is incompatible with gateways`,
+              `as the schema SDL is given directly by gateway. If you would`,
+              `like to customize the schema SDL reported, please instead set`,
+              `the option experimental_updateSupergraphSdl in your gateway`,
+              `configuration.`,
+            ].join(' '),
+          );
+        }
+        if (currentCoreSchema === undefined) {
+          throw new Error(
+            [
+              `Gateway unexpectedly did not set the SDL prior to Apollo Server`,
+              `running the serverWillStart hook.`,
+            ].join(' '),
+          );
+        }
+        coreSchema = currentCoreSchema;
+        // NOTE: It is critical that there is no await between here and the
+        // start of the schema reporter. If there is, the currentSchemaSdl
+        // might be updated by the gateway, which would result in that update
+        // being lost, and the schema reporter would report the wrong schema.
+        //
+        // We could refactor SchemaReporter to contain this complexity, but
+        // when this was tried, this resulted in a fair amount of pain (e.g.
+        // due to TS not having nice facilities around late initialization, and
+        // due to new field mutability making the SchemaReporter more fragile/
+        // harder to reason about).
+      }
+
       const coreSchemaHash = computeCoreSchemaHash(coreSchema);
 
       if (overrideReportedSchema !== undefined) {
@@ -160,7 +225,7 @@ export function ApolloServerPluginSchemaReporting(
           )}/ with server info ${JSON.stringify(schemaReport)}`,
       );
 
-      const schemaReporter = new SchemaReporter({
+      currentSchemaReporter = new SchemaReporter({
         schemaReport,
         coreSchema,
         apiKey: key,
@@ -173,12 +238,14 @@ export function ApolloServerPluginSchemaReporting(
         fallbackReportingDelayInMs: 20_000,
         fetcher,
       });
-
-      schemaReporter.start();
+      currentSchemaReporter.start();
 
       return {
         async serverWillStop() {
-          schemaReporter.stop();
+          if (gatewaySchemaChangeUnsubscriber) {
+            gatewaySchemaChangeUnsubscriber();
+          }
+          currentSchemaReporter?.stop();
         },
       };
     },

@@ -25,11 +25,23 @@ export const schemaReportGql = print(gql`
   }
 `);
 
+export interface SchemaReporterOptions {
+  schemaReport: SchemaReport;
+  coreSchema: string;
+  apiKey: string;
+  endpointUrl: string | undefined;
+  logger: Logger;
+  initialReportingDelayInMs: number;
+  fallbackReportingDelayInMs: number;
+  fetcher?: typeof fetch;
+}
+
 // This class is meant to be a thin shim around the gql mutations.
 export class SchemaReporter {
   // These mirror the gql variables
   private readonly schemaReport: SchemaReport;
   private readonly coreSchema: string;
+  private readonly apiKey: string;
   private readonly endpointUrl: string;
   private readonly logger: Logger;
   private readonly initialReportingDelayInMs: number;
@@ -40,16 +52,7 @@ export class SchemaReporter {
   private pollTimer?: NodeJS.Timer;
   private readonly headers: Headers;
 
-  constructor(options: {
-    schemaReport: SchemaReport;
-    coreSchema: string;
-    apiKey: string;
-    endpointUrl: string | undefined;
-    logger: Logger;
-    initialReportingDelayInMs: number;
-    fallbackReportingDelayInMs: number;
-    fetcher?: typeof fetch;
-  }) {
+  constructor(options: SchemaReporterOptions) {
     this.headers = new Headers();
     this.headers.set('Content-Type', 'application/json');
     this.headers.set('x-api-key', options.apiKey);
@@ -62,6 +65,7 @@ export class SchemaReporter {
       require('../../../package.json').version,
     );
 
+    this.apiKey = options.apiKey;
     this.endpointUrl =
       options.endpointUrl ||
       'https://schema-reporting.api.apollographql.com/api/graphql';
@@ -73,6 +77,19 @@ export class SchemaReporter {
     this.initialReportingDelayInMs = options.initialReportingDelayInMs;
     this.fallbackReportingDelayInMs = options.fallbackReportingDelayInMs;
     this.fetcher = options.fetcher ?? fetch;
+  }
+
+  public toOptions(): SchemaReporterOptions {
+    return {
+      schemaReport: this.schemaReport,
+      coreSchema: this.coreSchema,
+      apiKey: this.apiKey,
+      endpointUrl: this.endpointUrl,
+      logger: this.logger,
+      initialReportingDelayInMs: this.initialReportingDelayInMs,
+      fallbackReportingDelayInMs: this.fallbackReportingDelayInMs,
+      fetcher: this.fetcher,
+    };
   }
 
   public stopped(): Boolean {
